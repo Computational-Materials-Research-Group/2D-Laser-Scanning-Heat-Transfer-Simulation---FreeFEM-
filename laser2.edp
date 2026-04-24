@@ -1,0 +1,163 @@
+// ============================================
+// 2D Laser Heating - FreeFEM++
+// Beam scans LEFT to RIGHT: x=0 -> x=Lx
+// ============================================
+
+load "iovtk"
+
+string outdir = "C:\\Users\\pedit\\Downloads\\laser_results\\";
+system("mkdir \"C:\\Users\\pedit\\Downloads\\laser_results\"");
+
+// ---- Geometry ----
+real Lx = 10e-3;
+real Ly = 5e-3;
+
+int BotEdge   = 1;
+int RightEdge = 2;
+int TopEdge   = 3;
+int LeftEdge  = 4;
+
+border E1(t=0., Lx)  { x=t;    y=0.;   label=BotEdge;   }
+border E2(t=0., Ly)  { x=Lx;   y=t;    label=RightEdge; }
+border E3(t=0., Lx)  { x=Lx-t; y=Ly;   label=TopEdge;   }
+border E4(t=0., Ly)  { x=0.;   y=Ly-t; label=LeftEdge;  }
+
+mesh Th = buildmesh(E1(80) + E2(40) + E3(80) + E4(40));
+
+func rfine = 2e-4 / (1. + 20.*sqrt((x-Lx/2.)*(x-Lx/2.) + (y-Ly)*(y-Ly)) / (2e-3));
+Th = adaptmesh(Th, rfine, IsMetric=1, nbvx=80000, hmax=Lx/40., hmin=Lx/400.);
+
+// ---- Material Properties (Steel) ----
+real rho   = 8000.;
+real cp    = 500.;
+real kk    = 50.;
+real hc    = 20.;
+real T0    = 300.;
+real Tmelt = 1700.;
+
+// ---- Laser Parameters ----
+real P      = 500.;
+real r0     = 5e-4;
+real absorb = 0.3;
+real r0sq   = r0 * r0;
+real Qpeak  = absorb * 2. * P / (pi * r0sq);
+
+// ---- Scan Parameters ----
+real vbeam  = 5e-3;
+real tscan  = Lx / vbeam;
+real dt     = 5e-4;
+int  nt     = int(tscan / dt);
+real xstart = 0.;
+real xend   = Lx;
+
+// ---- FE Space ----
+fespace Vh(Th, P1);
+Vh T, Told, v;
+Vh gradTx, gradTy, heatflux;
+
+// ---- Global beam center ----
+real xc = xstart;
+
+// ---- Initialize ----
+T    = T0;
+Told = T0;
+
+// ---- Assemble LHS matrix ONCE ----
+varf aLHS(T, v) =
+      int2d(Th)( (rho*cp/dt) * T * v )
+    + int2d(Th)( kk * (dx(T)*dx(v) + dy(T)*dy(v)) )
+    + int1d(Th, BotEdge)(   hc * T * v )
+    + int1d(Th, RightEdge)( hc * T * v )
+    + int1d(Th, TopEdge)(   hc * T * v )
+    + int1d(Th, LeftEdge)(  hc * T * v )
+    ;
+
+matrix A = aLHS(Vh, Vh);
+set(A, solver=CG);
+
+// ---- PVD Header ----
+{
+ofstream pvd(outdir + "laser.pvd");
+pvd << "<?xml version=\"1.0\"?>" << endl;
+pvd << "<VTKFile type=\"Collection\" version=\"0.1\">" << endl;
+pvd << "<Collection>" << endl;
+}
+
+// ---- FIXED: plain ASCII only in all strings ----
+cout << "======================================" << endl;
+cout << " Laser Heating Full Scan"               << endl;
+cout << " x: 0 to " << Lx*1e3   << " mm"        << endl;
+cout << " vbeam = " << vbeam*1e3 << " mm/s"      << endl;
+cout << " tscan = " << tscan     << " s"         << endl;
+cout << " steps = " << nt                        << endl;
+cout << "======================================" << endl;
+
+// ---- Time Loop ----
+for (int i = 1; i <= nt; i++) {
+    real t = i * dt;
+
+    // Beam moves left to right
+    xc = xstart + vbeam * t;
+    if (xc > xend) xc = xend;
+
+    // ---- Build RHS each step ----
+    varf aRHS(unused, v) =
+          int2d(Th)( (rho*cp/dt) * Told * v )
+        + int1d(Th, BotEdge)(   hc * T0 * v )
+        + int1d(Th, RightEdge)( hc * T0 * v )
+        + int1d(Th, TopEdge)(   hc * T0 * v )
+        + int1d(Th, LeftEdge)(  hc * T0 * v )
+        + int1d(Th, TopEdge)(
+              Qpeak * exp(-2.*(x-xc)*(x-xc)/r0sq) * v
+          )
+        ;
+
+    real[int] b = aRHS(0, Vh);
+    T[] = A^-1 * b;
+
+    // ---- Clamp at melting point ----
+    for (int j = 0; j < T[].n; j++)
+        if (T[][j] > Tmelt) T[][j] = Tmelt;
+
+    Told = T;
+
+    // ---- Derived fields ----
+    gradTx   = dx(T);
+    gradTy   = dy(T);
+    heatflux = sqrt(dx(T)*dx(T) + dy(T)*dy(T)) * kk;
+
+    // ---- Save every 4 steps ----
+    if (i % 4 == 0) {
+        string num;
+        if      (i < 10)   num = "000" + i;
+        else if (i < 100)  num = "00"  + i;
+        else if (i < 1000) num = "0"   + i;
+        else               num = ""    + i;
+
+        int[int] ord = [1, 1, 1, 1];
+        savevtk(outdir + "result_" + num + ".vtu", Th,
+                T, gradTx, gradTy, heatflux,
+                dataname = "Temperature gradTx gradTy HeatFlux",
+                order = ord);
+
+        {
+        ofstream pvd(outdir + "laser.pvd", append);
+        pvd << "  <DataSet timestep=\"" << t
+            << "\" file=\"result_" << num << ".vtu\"/>" << endl;
+        }
+
+        cout << "Step " << i << "/" << nt
+             << "  t="     << t       << " s"
+             << "  xbeam=" << xc*1e3  << " mm"
+             << "  Tmax="  << T[].max << " K" << endl;
+    }
+}
+
+// ---- Close PVD ----
+{
+ofstream pvd(outdir + "laser.pvd", append);
+pvd << "</Collection>" << endl;
+pvd << "</VTKFile>"    << endl;
+}
+
+cout << "Done. Open laser.pvd in ParaView." << endl;
